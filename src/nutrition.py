@@ -1,515 +1,482 @@
 #!/usr/bin/env python3
 """
-Nutrition tracking and meal planning system.
-Personal nutrition management with meal logging and dietary analysis.
+BlackRoad Nutrition Tracker
+Production nutrition logging with macro calculation, RDA comparison, and CSV export.
+
+Usage:
+    python nutrition.py add-food --name "Apple" --cal 95 --protein 0.5 --carbs 25 --fat 0.3
+    python nutrition.py log-meal --user alice --meal breakfast --foods 1:150,2:80
+    python nutrition.py summary --user alice --date 2024-01-15
+    python nutrition.py macros --user alice --date 2024-01-15
+    python nutrition.py gaps --user alice --date 2024-01-15
+    python nutrition.py export --user alice --days 30
 """
 
-import os
+from __future__ import annotations
+
+import argparse
+import csv
 import json
 import sqlite3
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from io import StringIO
+from pathlib import Path
 from typing import Dict, List, Optional
-from enum import Enum
-import uuid
-import argparse
 
-# Database setup
-DB_PATH = os.path.expanduser("~/.blackroad/nutrition.db")
+DB_PATH = Path.home() / ".blackroad" / "nutrition_tracker.db"
 
-class FoodCategory(Enum):
-    FRUIT = "fruit"
-    VEGETABLE = "vegetable"
-    GRAIN = "grain"
-    PROTEIN = "protein"
-    DAIRY = "dairy"
-    FAT = "fat"
-    BEVERAGE = "beverage"
-    SNACK = "snack"
+# ── RDA / DRI reference values ─────────────────────────────────────────────────
+RDA: Dict[str, Dict[str, float]] = {
+    "calories":    {"male": 2500, "female": 2000, "default": 2000},
+    "protein_g":   {"male": 56,   "female": 46,   "default": 50},
+    "carbs_g":     {"male": 300,  "female": 225,  "default": 260},
+    "fat_g":       {"male": 78,   "female": 65,   "default": 70},
+    "fiber_g":     {"male": 38,   "female": 25,   "default": 30},
+    "sodium_mg":   {"male": 2300, "female": 2300, "default": 2300},
+    "calcium_mg":  {"male": 1000, "female": 1000, "default": 1000},
+    "iron_mg":     {"male": 8,    "female": 18,   "default": 12},
+    "vitamin_c_mg":{"male": 90,   "female": 75,   "default": 80},
+    "vitamin_d_iu":{"male": 600,  "female": 600,  "default": 600},
+    "potassium_mg":{"male": 3400, "female": 2600, "default": 3000},
+}
 
-class MealType(Enum):
-    BREAKFAST = "breakfast"
-    LUNCH = "lunch"
-    DINNER = "dinner"
-    SNACK = "snack"
+MACRO_KEYS    = ["calories", "protein_g", "carbs_g", "fat_g", "fiber_g"]
+MICRONUTRIENTS = ["sodium_mg", "calcium_mg", "iron_mg", "vitamin_c_mg", "vitamin_d_iu", "potassium_mg"]
+
+
+# ── Dataclasses ────────────────────────────────────────────────────────────────
 
 @dataclass
 class Food:
-    id: str
-    name: str
-    category: str
-    calories_per_100g: float
-    protein_g: float
-    carbs_g: float
-    fat_g: float
-    fiber_g: float = 0
-    sugar_g: float = 0
-    sodium_mg: float = 0
-    vitamins: Dict = field(default_factory=dict)
+    id:              int
+    name:            str
+    calories:        float
+    protein_g:       float
+    carbs_g:         float
+    fat_g:           float
+    fiber_g:         float
+    serving_size_g:  float
+    sodium_mg:       float = 0.0
+    calcium_mg:      float = 0.0
+    iron_mg:         float = 0.0
+    vitamin_c_mg:    float = 0.0
+    vitamin_d_iu:    float = 0.0
+    potassium_mg:    float = 0.0
+    brand:           str   = ""
+    category:        str   = "general"
+    created_at:      str   = field(default_factory=lambda: datetime.now().isoformat())
+
+    def scale(self, amount_g: float) -> "Food":
+        """Return a new Food scaled to the given gram weight."""
+        if self.serving_size_g <= 0:
+            return self
+        factor = amount_g / self.serving_size_g
+        return Food(
+            id=self.id, name=self.name,
+            calories=round(self.calories * factor, 2),
+            protein_g=round(self.protein_g * factor, 2),
+            carbs_g=round(self.carbs_g * factor, 2),
+            fat_g=round(self.fat_g * factor, 2),
+            fiber_g=round(self.fiber_g * factor, 2),
+            serving_size_g=amount_g,
+            sodium_mg=round(self.sodium_mg * factor, 2),
+            calcium_mg=round(self.calcium_mg * factor, 2),
+            iron_mg=round(self.iron_mg * factor, 2),
+            vitamin_c_mg=round(self.vitamin_c_mg * factor, 2),
+            vitamin_d_iu=round(self.vitamin_d_iu * factor, 2),
+            potassium_mg=round(self.potassium_mg * factor, 2),
+            brand=self.brand, category=self.category, created_at=self.created_at,
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
 
 @dataclass
-class MealEntry:
-    id: str
-    user_id: str
-    food_id: str
-    grams: float
-    meal_type: str
-    date: str
-    notes: str = ""
+class Meal:
+    id:        int
+    user_id:   str
+    meal_type: str          # breakfast / lunch / dinner / snack
+    date:      str          # YYYY-MM-DD
+    logged_at: str
+    notes:     str
+    items:     List[dict] = field(default_factory=list)
 
-class NutritionTracker:
-    def __init__(self):
-        self.db_path = DB_PATH
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
-        self._initialize_common_foods()
-    
-    def _init_db(self):
-        """Initialize SQLite database."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS foods (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            category TEXT NOT NULL,
-            calories_per_100g REAL NOT NULL,
-            protein_g REAL NOT NULL,
-            carbs_g REAL NOT NULL,
-            fat_g REAL NOT NULL,
-            fiber_g REAL DEFAULT 0,
-            sugar_g REAL DEFAULT 0,
-            sodium_mg REAL DEFAULT 0,
-            vitamins TEXT DEFAULT '{}'
-        )''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS meals (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            food_id TEXT NOT NULL,
-            grams REAL NOT NULL,
+    def totals(self) -> dict:
+        out: Dict[str, float] = {k: 0.0 for k in MACRO_KEYS + MICRONUTRIENTS}
+        for item in self.items:
+            for k in out:
+                out[k] = round(out[k] + item.get(k, 0.0), 2)
+        return out
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["totals"] = self.totals()
+        return d
+
+
+@dataclass
+class FoodLog:
+    user_id: str
+    meals:   List[Meal]
+
+    def daily_totals(self, log_date: str) -> dict:
+        totals: Dict[str, float] = {k: 0.0 for k in MACRO_KEYS + MICRONUTRIENTS}
+        for meal in self.meals:
+            if meal.date == log_date:
+                for k, v in meal.totals().items():
+                    totals[k] = round(totals[k] + v, 2)
+        return totals
+
+
+# ── Database ───────────────────────────────────────────────────────────────────
+
+def get_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _init_db(conn)
+    return conn
+
+
+def _init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS foods (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            name           TEXT    NOT NULL,
+            calories       REAL    NOT NULL DEFAULT 0,
+            protein_g      REAL    NOT NULL DEFAULT 0,
+            carbs_g        REAL    NOT NULL DEFAULT 0,
+            fat_g          REAL    NOT NULL DEFAULT 0,
+            fiber_g        REAL    NOT NULL DEFAULT 0,
+            serving_size_g REAL    NOT NULL DEFAULT 100,
+            sodium_mg      REAL    NOT NULL DEFAULT 0,
+            calcium_mg     REAL    NOT NULL DEFAULT 0,
+            iron_mg        REAL    NOT NULL DEFAULT 0,
+            vitamin_c_mg   REAL    NOT NULL DEFAULT 0,
+            vitamin_d_iu   REAL    NOT NULL DEFAULT 0,
+            potassium_mg   REAL    NOT NULL DEFAULT 0,
+            brand          TEXT    NOT NULL DEFAULT '',
+            category       TEXT    NOT NULL DEFAULT 'general',
+            created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_food_name ON foods(name);
+
+        CREATE TABLE IF NOT EXISTS meals (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   TEXT NOT NULL,
             meal_type TEXT NOT NULL,
-            date TEXT NOT NULL,
-            notes TEXT,
-            logged_at TEXT NOT NULL,
-            FOREIGN KEY(food_id) REFERENCES foods(id)
-        )''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS goals (
-            user_id TEXT PRIMARY KEY,
-            calories INTEGER DEFAULT 2000,
-            protein_g REAL DEFAULT 50,
-            carbs_g REAL DEFAULT 260,
-            fat_g REAL DEFAULT 65,
-            fiber_g REAL DEFAULT 25,
-            updated_at TEXT NOT NULL
-        )''')
-        
-        conn.commit()
-        conn.close()
-    
-    def _initialize_common_foods(self):
-        """Initialize common foods."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        c.execute('SELECT COUNT(*) FROM foods')
-        if c.fetchone()[0] == 0:
-            common_foods = [
-                ('apple', 'fruit', 52, 0.3, 14, 0.2, 2.4, 10),
-                ('banana', 'fruit', 89, 1.1, 23, 0.3, 2.6, 12),
-                ('chicken_breast', 'protein', 165, 31, 0, 3.6, 0, 0),
-                ('rice', 'grain', 130, 2.7, 28, 0.3, 0.4, 0.1),
-                ('broccoli', 'vegetable', 34, 2.8, 7, 0.4, 2.4, 1.5),
-                ('eggs', 'protein', 155, 13, 1.1, 11, 0, 0.6),
-                ('oats', 'grain', 389, 17, 66, 7, 10.6, 0),
-                ('salmon', 'protein', 208, 20, 0, 13, 0, 0),
-                ('almonds', 'fat', 579, 21, 22, 50, 12.5, 4.4),
-                ('spinach', 'vegetable', 23, 2.9, 3.6, 0.4, 2.2, 0.4),
-                ('sweet_potato', 'vegetable', 86, 1.6, 20, 0.1, 3, 4.2),
-                ('greek_yogurt', 'dairy', 59, 10, 3.3, 0.4, 0, 0.4),
-                ('olive_oil', 'fat', 884, 0, 0, 100, 0, 0),
-                ('lentils', 'protein', 116, 9, 20, 0.4, 7.8, 1.5),
-                ('blueberries', 'fruit', 57, 0.7, 14, 0.3, 2.4, 10),
-                ('milk', 'dairy', 61, 3.2, 4.8, 3.3, 0, 0),
-                ('cheese', 'dairy', 402, 25, 1.3, 33, 0, 0.7),
-                ('bread', 'grain', 265, 9, 49, 3.3, 2.7, 4),
-                ('pasta', 'grain', 131, 5, 25, 1.1, 1.8, 0.3),
-                ('orange', 'fruit', 47, 0.9, 12, 0.3, 2.4, 9),
-            ]
-            
-            for name, cat, cal, prot, carbs, fat, fiber, sugar in common_foods:
-                food_id = f"F_{uuid.uuid4().hex[:8].upper()}"
-                c.execute('''INSERT INTO foods VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                         (food_id, name, cat, cal, prot, carbs, fat, fiber, sugar, 0, '{}'))
-            
-            conn.commit()
-        
-        conn.close()
-    
-    def add_food(self, name: str, category: str, cal: float, protein: float, carbs: float,
-                fat: float, fiber: float = 0, sugar: float = 0, sodium: float = 0,
-                vitamins: Optional[Dict] = None) -> Food:
-        """Add a new food to database."""
-        if category not in [c.value for c in FoodCategory]:
-            raise ValueError(f"Invalid category. Must be one of {[c.value for c in FoodCategory]}")
-        
-        food_id = f"F_{uuid.uuid4().hex[:8].upper()}"
-        vitamins = vitamins or {}
-        
-        food = Food(
-            id=food_id,
-            name=name,
-            category=category,
-            calories_per_100g=cal,
-            protein_g=protein,
-            carbs_g=carbs,
-            fat_g=fat,
-            fiber_g=fiber,
-            sugar_g=sugar,
-            sodium_mg=sodium,
-            vitamins=vitamins
+            date      TEXT NOT NULL,
+            logged_at TEXT NOT NULL DEFAULT (datetime('now')),
+            notes     TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_meal_user_date ON meals(user_id, date);
+
+        CREATE TABLE IF NOT EXISTS meal_items (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            meal_id      INTEGER NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
+            food_id      INTEGER NOT NULL REFERENCES foods(id),
+            food_name    TEXT    NOT NULL DEFAULT '',
+            amount_g     REAL    NOT NULL DEFAULT 100,
+            calories     REAL    NOT NULL DEFAULT 0,
+            protein_g    REAL    NOT NULL DEFAULT 0,
+            carbs_g      REAL    NOT NULL DEFAULT 0,
+            fat_g        REAL    NOT NULL DEFAULT 0,
+            fiber_g      REAL    NOT NULL DEFAULT 0,
+            sodium_mg    REAL    NOT NULL DEFAULT 0,
+            calcium_mg   REAL    NOT NULL DEFAULT 0,
+            iron_mg      REAL    NOT NULL DEFAULT 0,
+            vitamin_c_mg REAL    NOT NULL DEFAULT 0,
+            vitamin_d_iu REAL    NOT NULL DEFAULT 0,
+            potassium_mg REAL    NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            user_id        TEXT PRIMARY KEY,
+            sex            TEXT NOT NULL DEFAULT 'default',
+            age            INTEGER NOT NULL DEFAULT 0,
+            weight_kg      REAL    NOT NULL DEFAULT 0,
+            height_cm      REAL    NOT NULL DEFAULT 0,
+            activity_level TEXT    NOT NULL DEFAULT 'moderate'
+        );
+    """)
+    conn.commit()
+
+
+# ── Food API ───────────────────────────────────────────────────────────────────
+
+def add_food(
+    name: str, calories: float, protein_g: float, carbs_g: float,
+    fat_g: float, fiber_g: float = 0.0, serving_size_g: float = 100.0,
+    **extras
+) -> Food:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO foods(name,calories,protein_g,carbs_g,fat_g,fiber_g,serving_size_g,"
+            "sodium_mg,calcium_mg,iron_mg,vitamin_c_mg,vitamin_d_iu,potassium_mg,brand,category)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (name, calories, protein_g, carbs_g, fat_g, fiber_g, serving_size_g,
+             extras.get("sodium_mg", 0), extras.get("calcium_mg", 0),
+             extras.get("iron_mg", 0), extras.get("vitamin_c_mg", 0),
+             extras.get("vitamin_d_iu", 0), extras.get("potassium_mg", 0),
+             extras.get("brand", ""), extras.get("category", "general")),
         )
-        
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute('''INSERT INTO foods VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                 (food.id, food.name, food.category, food.calories_per_100g,
-                  food.protein_g, food.carbs_g, food.fat_g, food.fiber_g,
-                  food.sugar_g, food.sodium_mg, json.dumps(food.vitamins)))
         conn.commit()
-        conn.close()
-        
-        return food
-    
-    def log_meal(self, user_id: str, food_id: str, grams: float, meal_type: str,
-                date: Optional[str] = None) -> MealEntry:
-        """Log a meal entry."""
-        if meal_type not in [m.value for m in MealType]:
-            raise ValueError(f"Invalid meal type. Must be one of {[m.value for m in MealType]}")
-        
-        date = date or datetime.now().strftime('%Y-%m-%d')
-        meal_id = f"M_{uuid.uuid4().hex[:8].upper()}"
-        now = datetime.now().isoformat()
-        
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Verify food exists
-        c.execute('SELECT * FROM foods WHERE id = ?', (food_id,))
-        if not c.fetchone():
-            conn.close()
-            raise ValueError(f"Food {food_id} not found")
-        
-        meal = MealEntry(
-            id=meal_id,
-            user_id=user_id,
-            food_id=food_id,
-            grams=grams,
-            meal_type=meal_type,
-            date=date
+        return get_food(cur.lastrowid)
+
+
+def get_food(food_id: int) -> Optional[Food]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM foods WHERE id=?", (food_id,)).fetchone()
+    return Food(**dict(row)) if row else None
+
+
+def search_foods(query: str, limit: int = 20) -> List[Food]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM foods WHERE name LIKE ? ORDER BY name LIMIT ?",
+            (f"%{query}%", limit),
+        ).fetchall()
+    return [Food(**dict(r)) for r in rows]
+
+
+# ── Meal API ───────────────────────────────────────────────────────────────────
+
+def log_meal(
+    user_id: str,
+    foods: List[Dict],
+    meal_type: str = "lunch",
+    log_date: Optional[str] = None,
+    notes: str = "",
+) -> Meal:
+    if log_date is None:
+        log_date = date.today().isoformat()
+    now = datetime.now().isoformat()
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO meals(user_id,meal_type,date,logged_at,notes) VALUES(?,?,?,?,?)",
+            (user_id, meal_type, log_date, now, notes),
         )
-        
-        c.execute('''INSERT INTO meals VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                 (meal.id, meal.user_id, meal.food_id, meal.grams,
-                  meal.meal_type, meal.date, meal.notes, now))
-        
-        # Initialize user goals if not exists
-        c.execute('SELECT * FROM goals WHERE user_id = ?', (user_id,))
-        if not c.fetchone():
-            c.execute('''INSERT INTO goals (user_id, updated_at) VALUES (?, ?)''',
-                     (user_id, now))
-        
-        conn.commit()
-        conn.close()
-        
-        return meal
-    
-    def set_goals(self, user_id: str, calories: int = 2000, protein: float = 50,
-                 carbs: float = 260, fat: float = 65, fiber: float = 25):
-        """Set daily nutrition goals."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        now = datetime.now().isoformat()
-        c.execute('''INSERT OR REPLACE INTO goals (user_id, calories, protein_g, carbs_g, fat_g, fiber_g, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                 (user_id, calories, protein, carbs, fat, fiber, now))
-        conn.commit()
-        conn.close()
-    
-    def get_daily_summary(self, user_id: str, date: Optional[str] = None) -> Dict:
-        """Get daily nutrition summary."""
-        date = date or datetime.now().strftime('%Y-%m-%d')
-        
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Get meals for the day
-        c.execute('''SELECT m.grams, f.calories_per_100g, f.protein_g, f.carbs_g, f.fat_g, f.fiber_g, f.sodium_mg
-                    FROM meals m
-                    JOIN foods f ON m.food_id = f.id
-                    WHERE m.user_id = ? AND m.date = ?''',
-                 (user_id, date))
-        
-        meals = c.fetchall()
-        
-        # Sum up macros
-        totals = {
-            "calories": 0,
-            "protein_g": 0,
-            "carbs_g": 0,
-            "fat_g": 0,
-            "fiber_g": 0,
-            "sodium_mg": 0
-        }
-        
-        for grams, cal, prot, carb, fat, fib, sod in meals:
-            multiplier = grams / 100
-            totals["calories"] += cal * multiplier
-            totals["protein_g"] += prot * multiplier
-            totals["carbs_g"] += carb * multiplier
-            totals["fat_g"] += fat * multiplier
-            totals["fiber_g"] += fib * multiplier
-            totals["sodium_mg"] += sod * multiplier
-        
-        # Get goals
-        c.execute('SELECT * FROM goals WHERE user_id = ?', (user_id,))
-        goals_row = c.fetchone()
-        conn.close()
-        
-        if goals_row:
-            goals = {
-                "calories": goals_row[1],
-                "protein_g": goals_row[2],
-                "carbs_g": goals_row[3],
-                "fat_g": goals_row[4],
-                "fiber_g": goals_row[5]
-            }
-        else:
-            goals = {
-                "calories": 2000,
-                "protein_g": 50,
-                "carbs_g": 260,
-                "fat_g": 65,
-                "fiber_g": 25
-            }
-        
-        # Calculate percentages
-        summary = {
-            "date": date,
-            "totals": {k: round(v, 1) for k, v in totals.items()},
-            "goals": goals,
-            "percentages": {
-                "calories": round(totals["calories"] / goals["calories"] * 100, 1),
-                "protein": round(totals["protein_g"] / goals["protein_g"] * 100, 1),
-                "carbs": round(totals["carbs_g"] / goals["carbs_g"] * 100, 1),
-                "fat": round(totals["fat_g"] / goals["fat_g"] * 100, 1)
-            },
-            "meal_count": len(meals)
-        }
-        
-        return summary
-    
-    def get_weekly_report(self, user_id: str) -> Dict:
-        """Get 7-day nutrition report."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        daily_summaries = []
-        total_days = {}
-        
-        for i in range(7):
-            date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
-            summary = self.get_daily_summary(user_id, date)
-            daily_summaries.append(summary)
-            
-            for key, val in summary["totals"].items():
-                total_days.setdefault(key, []).append(val)
-        
-        # Calculate averages
-        averages = {k: round(sum(v) / len(v), 1) for k, v in total_days.items()}
-        
-        conn.close()
-        
-        return {
-            "period": "last_7_days",
-            "daily_summaries": daily_summaries,
-            "averages": averages
-        }
-    
-    def search_food(self, query: str) -> List[Food]:
-        """Search foods by name or category."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        query_lower = query.lower()
-        c.execute('''SELECT * FROM foods WHERE LOWER(name) LIKE ? OR LOWER(category) LIKE ?''',
-                 (f'%{query_lower}%', f'%{query_lower}%'))
-        
-        foods = []
-        for row in c.fetchall():
-            foods.append(Food(
-                id=row[0], name=row[1], category=row[2], calories_per_100g=row[3],
-                protein_g=row[4], carbs_g=row[5], fat_g=row[6], fiber_g=row[7],
-                sugar_g=row[8], sodium_mg=row[9], vitamins=json.loads(row[10])
-            ))
-        
-        conn.close()
-        return foods
-    
-    def meal_suggestions(self, user_id: str, meal_type: str) -> List[Dict]:
-        """Suggest foods to meet remaining macro targets."""
-        summary = self.get_daily_summary(user_id)
-        
-        # Calculate remaining macros
-        remaining = {
-            "calories": summary["goals"]["calories"] - summary["totals"]["calories"],
-            "protein_g": summary["goals"]["protein_g"] - summary["totals"]["protein_g"],
-            "carbs_g": summary["goals"]["carbs_g"] - summary["totals"]["carbs_g"],
-            "fat_g": summary["goals"]["fat_g"] - summary["totals"]["fat_g"]
-        }
-        
-        # Suggest based on meal type
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        if meal_type == "breakfast":
-            c.execute('SELECT * FROM foods WHERE category IN (?, ?, ?)', ('grain', 'fruit', 'dairy'))
-        elif meal_type == "lunch" or meal_type == "dinner":
-            c.execute('SELECT * FROM foods WHERE category IN (?, ?, ?)', ('protein', 'vegetable', 'grain'))
-        else:
-            c.execute('SELECT * FROM foods WHERE category IN (?, ?)', ('snack', 'fruit'))
-        
-        foods = c.fetchall()
-        conn.close()
-        
-        suggestions = []
-        for food_row in foods[:5]:
-            food = Food(
-                id=food_row[0], name=food_row[1], category=food_row[2],
-                calories_per_100g=food_row[3], protein_g=food_row[4],
-                carbs_g=food_row[5], fat_g=food_row[6]
+        meal_id = cur.lastrowid
+
+        items_data = []
+        for entry in foods:
+            fid    = entry["food_id"]
+            amount = entry.get("amount_g", 100.0)
+            food   = get_food(fid)
+            if not food:
+                continue
+            scaled = food.scale(amount)
+            conn.execute(
+                "INSERT INTO meal_items(meal_id,food_id,food_name,amount_g,"
+                "calories,protein_g,carbs_g,fat_g,fiber_g,"
+                "sodium_mg,calcium_mg,iron_mg,vitamin_c_mg,vitamin_d_iu,potassium_mg)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (meal_id, fid, food.name, amount,
+                 scaled.calories, scaled.protein_g, scaled.carbs_g,
+                 scaled.fat_g, scaled.fiber_g,
+                 scaled.sodium_mg, scaled.calcium_mg, scaled.iron_mg,
+                 scaled.vitamin_c_mg, scaled.vitamin_d_iu, scaled.potassium_mg),
             )
-            
-            # Calculate macro match
-            portion = min(100, remaining["calories"] / max(food.calories_per_100g, 1))
-            
-            suggestions.append({
-                "food": food.name,
-                "food_id": food.id,
-                "suggested_grams": round(portion, 0),
-                "category": food.category,
-                "macros_per_portion": {
-                    "calories": round(food.calories_per_100g * portion / 100, 0),
-                    "protein_g": round(food.protein_g * portion / 100, 1),
-                    "carbs_g": round(food.carbs_g * portion / 100, 1),
-                    "fat_g": round(food.fat_g * portion / 100, 1)
-                }
+            items_data.append({
+                "food_id": fid, "food_name": food.name, "amount_g": amount,
+                "calories": scaled.calories, "protein_g": scaled.protein_g,
+                "carbs_g": scaled.carbs_g, "fat_g": scaled.fat_g, "fiber_g": scaled.fiber_g,
+                "sodium_mg": scaled.sodium_mg, "calcium_mg": scaled.calcium_mg,
+                "iron_mg": scaled.iron_mg, "vitamin_c_mg": scaled.vitamin_c_mg,
+                "vitamin_d_iu": scaled.vitamin_d_iu, "potassium_mg": scaled.potassium_mg,
             })
-        
-        return suggestions
-    
-    def analyze_deficiencies(self, user_id: str, days: int = 7) -> Dict:
-        """Analyze nutritional deficiencies over time."""
-        deficient_nutrients = {}
-        
-        for i in range(days):
-            date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
-            summary = self.get_daily_summary(user_id, date)
-            
-            if summary["percentages"]["calories"] < 90:
-                deficient_nutrients.setdefault("calories", []).append(summary["percentages"]["calories"])
-            if summary["percentages"]["protein"] < 80:
-                deficient_nutrients.setdefault("protein", []).append(summary["percentages"]["protein"])
-            if summary["percentages"]["carbs"] < 80:
-                deficient_nutrients.setdefault("carbs", []).append(summary["percentages"]["carbs"])
-            if summary["percentages"]["fat"] < 80:
-                deficient_nutrients.setdefault("fat", []).append(summary["percentages"]["fat"])
-        
-        # Calculate deficiency rates
-        analysis = {
-            "period_days": days,
-            "deficiencies": {}
+        conn.commit()
+
+    return Meal(meal_id, user_id, meal_type, log_date, now, notes, items_data)
+
+
+def _get_meals(user_id: str, log_date: str) -> List[Meal]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM meals WHERE user_id=? AND date=? ORDER BY logged_at",
+            (user_id, log_date),
+        ).fetchall()
+        meals = []
+        for row in rows:
+            m = dict(row)
+            item_rows = conn.execute(
+                "SELECT * FROM meal_items WHERE meal_id=?", (m["id"],)
+            ).fetchall()
+            m["items"] = [dict(r) for r in item_rows]
+            meals.append(Meal(**m))
+    return meals
+
+
+def daily_summary(user_id: str, log_date: Optional[str] = None) -> dict:
+    if log_date is None:
+        log_date = date.today().isoformat()
+    meals   = _get_meals(user_id, log_date)
+    fl      = FoodLog(user_id, meals)
+    totals  = fl.daily_totals(log_date)
+    return {
+        "user_id": user_id,
+        "date":    log_date,
+        "n_meals": len(meals),
+        "meals":   [m.to_dict() for m in meals],
+        "totals":  totals,
+    }
+
+
+def calculate_macros(user_id: str, log_date: Optional[str] = None) -> dict:
+    if log_date is None:
+        log_date = date.today().isoformat()
+    summary = daily_summary(user_id, log_date)
+    totals  = summary["totals"]
+    cal     = totals.get("calories", 0) or 1
+    return {
+        "user_id":    user_id,
+        "date":       log_date,
+        "calories":   totals["calories"],
+        "protein_g":  totals["protein_g"],
+        "carbs_g":    totals["carbs_g"],
+        "fat_g":      totals["fat_g"],
+        "fiber_g":    totals["fiber_g"],
+        "protein_pct": round(totals["protein_g"] * 4 / cal * 100, 1),
+        "carbs_pct":   round(totals["carbs_g"]   * 4 / cal * 100, 1),
+        "fat_pct":     round(totals["fat_g"]     * 9 / cal * 100, 1),
+    }
+
+
+def nutrient_gaps(user_id: str, log_date: Optional[str] = None, sex: str = "default") -> dict:
+    if log_date is None:
+        log_date = date.today().isoformat()
+    summary = daily_summary(user_id, log_date)
+    totals  = summary["totals"]
+    gaps: Dict[str, dict] = {}
+    for nutrient, ref in RDA.items():
+        target  = ref.get(sex, ref["default"])
+        actual  = totals.get(nutrient, 0.0)
+        pct     = round(actual / target * 100, 1) if target else 0
+        deficit = round(target - actual, 2)
+        gaps[nutrient] = {
+            "actual":  actual,
+            "target":  target,
+            "pct_met": pct,
+            "deficit": deficit if deficit > 0 else 0,
+            "surplus": abs(deficit) if deficit < 0 else 0,
+            "status":  "ok" if pct >= 80 else "low" if pct < 50 else "marginal",
         }
-        
-        for nutrient, percentages in deficient_nutrients.items():
-            rate = len(percentages) / days * 100
-            avg_deficit = 100 - (sum(percentages) / len(percentages))
-            analysis["deficiencies"][nutrient] = {
-                "deficiency_rate_pct": round(rate, 1),
-                "average_deficit_pct": round(avg_deficit, 1),
-                "days_deficient": len(percentages)
-            }
-        
-        return analysis
+    return {"user_id": user_id, "date": log_date, "gaps": gaps}
+
+
+def export_csv(user_id: str, days: int = 30) -> str:
+    all_dates = [
+        (date.today() - timedelta(days=i)).isoformat() for i in range(days)
+    ]
+    out    = StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["date"] + MACRO_KEYS + MICRONUTRIENTS)
+    for d in sorted(all_dates):
+        meals = _get_meals(user_id, d)
+        if not meals:
+            continue
+        fl     = FoodLog(user_id, meals)
+        totals = fl.daily_totals(d)
+        writer.writerow([d] + [totals.get(k, 0.0) for k in MACRO_KEYS + MICRONUTRIENTS])
+    return out.getvalue()
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def _print(obj):
+    print(json.dumps(obj if not isinstance(obj, str) else {"output": obj}, indent=2, default=str))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Nutrition tracking system")
-    subparsers = parser.add_subparsers(dest="command")
-    
-    # Log command
-    log_parser = subparsers.add_parser("log", help="Log a meal")
-    log_parser.add_argument("user_id")
-    log_parser.add_argument("food_name")
-    log_parser.add_argument("grams", type=float)
-    log_parser.add_argument("meal_type")
-    
-    # Summary command
-    summary_parser = subparsers.add_parser("summary", help="Daily summary")
-    summary_parser.add_argument("user_id")
-    summary_parser.add_argument("--date", default=None)
-    
-    # Suggest command
-    suggest_parser = subparsers.add_parser("suggest", help="Meal suggestions")
-    suggest_parser.add_argument("user_id")
-    suggest_parser.add_argument("meal_type")
-    
-    # Search command
-    search_parser = subparsers.add_parser("search", help="Search foods")
-    search_parser.add_argument("query")
-    
-    # Goals command
-    goals_parser = subparsers.add_parser("goals", help="Set goals")
-    goals_parser.add_argument("user_id")
-    goals_parser.add_argument("--calories", type=int, default=2000)
-    goals_parser.add_argument("--protein", type=float, default=50)
-    
+    parser = argparse.ArgumentParser(description="BlackRoad Nutrition Tracker")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("add-food", help="Add a food to the database")
+    p.add_argument("--name",     required=True)
+    p.add_argument("--cal",      type=float, required=True, dest="calories")
+    p.add_argument("--protein",  type=float, default=0,   dest="protein_g")
+    p.add_argument("--carbs",    type=float, default=0,   dest="carbs_g")
+    p.add_argument("--fat",      type=float, default=0,   dest="fat_g")
+    p.add_argument("--fiber",    type=float, default=0,   dest="fiber_g")
+    p.add_argument("--serving",  type=float, default=100, dest="serving_size_g")
+    p.add_argument("--sodium",   type=float, default=0,   dest="sodium_mg")
+    p.add_argument("--calcium",  type=float, default=0,   dest="calcium_mg")
+    p.add_argument("--iron",     type=float, default=0,   dest="iron_mg")
+    p.add_argument("--vitc",     type=float, default=0,   dest="vitamin_c_mg")
+    p.add_argument("--vitd",     type=float, default=0,   dest="vitamin_d_iu")
+    p.add_argument("--potassium",type=float, default=0,   dest="potassium_mg")
+    p.add_argument("--brand",    default="")
+    p.add_argument("--category", default="general")
+
+    p = sub.add_parser("search", help="Search foods by name")
+    p.add_argument("query")
+
+    p = sub.add_parser("log-meal", help="Log a meal")
+    p.add_argument("--user",  required=True)
+    p.add_argument("--meal",  required=True, choices=["breakfast","lunch","dinner","snack"],
+                   dest="meal_type")
+    p.add_argument("--foods", required=True, help="food_id[:amount_g],... e.g. 1:150,2:80")
+    p.add_argument("--date",  default=None)
+    p.add_argument("--notes", default="")
+
+    p = sub.add_parser("summary", help="Daily meal summary")
+    p.add_argument("--user", required=True)
+    p.add_argument("--date", default=None)
+
+    p = sub.add_parser("macros", help="Daily macro breakdown")
+    p.add_argument("--user", required=True)
+    p.add_argument("--date", default=None)
+
+    p = sub.add_parser("gaps", help="Nutrient gaps vs RDA")
+    p.add_argument("--user", required=True)
+    p.add_argument("--date", default=None)
+    p.add_argument("--sex",  default="default", choices=["male","female","default"])
+
+    p = sub.add_parser("export", help="Export daily totals as CSV")
+    p.add_argument("--user", required=True)
+    p.add_argument("--days", type=int, default=30)
+
     args = parser.parse_args()
-    tracker = NutritionTracker()
-    
-    if args.command == "log":
-        foods = tracker.search_food(args.food_name)
-        if not foods:
-            print(f"✗ Food '{args.food_name}' not found")
-            return
-        
-        meal = tracker.log_meal(args.user_id, foods[0].id, args.grams, args.meal_type)
-        print(f"✓ Logged: {args.grams}g of {foods[0].name} ({args.meal_type})")
-    
-    elif args.command == "summary":
-        summary = tracker.get_daily_summary(args.user_id, args.date)
-        print(f"\n📊 Daily Summary ({summary['date']}):")
-        print(json.dumps(summary, indent=2))
-    
-    elif args.command == "suggest":
-        suggestions = tracker.meal_suggestions(args.user_id, args.meal_type)
-        print(f"\n🍽 Suggestions for {args.meal_type}:")
-        print(json.dumps(suggestions, indent=2, default=str))
-    
-    elif args.command == "search":
-        foods = tracker.search_food(args.query)
-        print(f"✓ Found {len(foods)} foods:")
-        for food in foods[:10]:
-            print(f"  • {food.name} ({food.category}): {food.calories_per_100g} cal/100g")
-    
-    elif args.command == "goals":
-        tracker.set_goals(args.user_id, args.calories, args.protein)
-        print(f"✓ Goals set for {args.user_id}")
-    
-    else:
-        parser.print_help()
+
+    if args.cmd == "add-food":
+        f = add_food(
+            args.name, args.calories, args.protein_g, args.carbs_g, args.fat_g,
+            args.fiber_g, args.serving_size_g,
+            sodium_mg=args.sodium_mg, calcium_mg=args.calcium_mg, iron_mg=args.iron_mg,
+            vitamin_c_mg=args.vitamin_c_mg, vitamin_d_iu=args.vitamin_d_iu,
+            potassium_mg=args.potassium_mg, brand=args.brand, category=args.category,
+        )
+        _print({"status": "added", "id": f.id, "name": f.name, "calories": f.calories})
+
+    elif args.cmd == "search":
+        foods = search_foods(args.query)
+        _print([f.to_dict() for f in foods])
+
+    elif args.cmd == "log-meal":
+        food_entries = []
+        for token in args.foods.split(","):
+            parts = token.strip().split(":")
+            food_entries.append({
+                "food_id":  int(parts[0]),
+                "amount_g": float(parts[1]) if len(parts) > 1 else 100.0,
+            })
+        meal = log_meal(args.user, food_entries, args.meal_type, args.date, args.notes)
+        _print(meal.to_dict())
+
+    elif args.cmd == "summary":
+        _print(daily_summary(args.user, args.date))
+
+    elif args.cmd == "macros":
+        _print(calculate_macros(args.user, args.date))
+
+    elif args.cmd == "gaps":
+        _print(nutrient_gaps(args.user, args.date, args.sex))
+
+    elif args.cmd == "export":
+        print(export_csv(args.user, args.days))
 
 
 if __name__ == "__main__":
